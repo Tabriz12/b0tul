@@ -1,0 +1,7 @@
+BOT_ID = "B0tulBot"
+
+
+
+### Ollama
+
+OLLAMA_MODEL = "qwen3:8b"

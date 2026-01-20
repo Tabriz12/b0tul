@@ -1,0 +1,55 @@
+
+services:
+  telegram_bot:
+    build:
+      context: .
+      dockerfile: main.Dockerfile
+    container_name: telegram_bot
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+    
+    volumes:
+      - .:/app
+
+    command: ["poetry", "run", "python", "-m", "telegram_bot.main"]
+
+    depends_on:
+      - ollama
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    volumes:
+      - ./ollama:/root/.ollama
+    ports:
+      - "11434:11434"
+    tty: true
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: nvidia
+            capabilities: ["gpu"]
+            count: all
+    restart: unless-stopped
+  
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    volumes:
+      - open-webui:/app/backend/data
+    depends_on:
+      - ollama
+    ports:
+      - 3000:8080
+    environment:
+      - 'OLLAMA_BASE_URL=http://ollama:11434'
+      - 'WEBUI_SECRET_KEY='
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    restart: unless-stopped
+
+volumes:
+  ollama:
+  open-webui:
