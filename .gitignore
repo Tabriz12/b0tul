@@ -5,4 +5,4 @@ ollama
 open-webui
 *__pycache__
 *.log
-src/telegram_bot/llm/selenium.py
+processed_jobs.json
