@@ -48,21 +48,27 @@ class DjinniParser:
     def check_job_board(self, page: Page) -> None:
         page.wait_for_selector("[id^='job-item-']", timeout=60000)
 
-        job_items = page.locator("[id^='job-item-']")
-        total = job_items.count()
+        job_ids = page.locator("[id^='job-item-']").evaluate_all(
+            "els => els.map(e => e.id.replace('job-item-', ''))"
+        )
 
-        for i in range(total):
-            job = job_items.nth(i)
-            job_id_attr = job.get_attribute("id")  # job-item-123456
-            job_id = job_id_attr.replace("job-item-", "")
+        print(f"{len(job_ids)} job items found.")
 
+        for job_id in job_ids:
             if job_id in self.processed_ids:
                 print(f"Skipping already processed job {job_id}")
                 continue
 
             print(f"Processing job {job_id}")
 
-            self.process_single_job(page, job_id)
+            job_page = self.context.new_page()
+            job_page.goto(page.url)
+
+            self.process_single_job(job_page, job_id)
+
+            print(f"Finished processing job {job_id}")
+
+            job_page.close()
 
             # TODO: extract message / details here
 
@@ -75,6 +81,7 @@ class DjinniParser:
 
         title_link = job_container.locator("a.job-item__title-link")
 
+        # click to open job details
         title_link.click()
 
         description_selector = "div.job-post__description"
@@ -89,7 +96,7 @@ class DjinniParser:
         # TODO: save description somewhere
         # self.save_job_description(job_id, description)
 
-        apply_button = page.locator("button.js-inbox-toggle-reply-form")
+        apply_button = page.locator("button.js-inbox-toggle-reply-form").first
 
         if apply_button.is_visible():
             print(f"Apply button found for job {job_id}")
@@ -101,10 +108,10 @@ class DjinniParser:
 
     def go_to_dashboard(self) -> None:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=False)
-            context = browser.new_context(locale="en-US")
+            self.browser = p.chromium.launch(headless=False)
+            self.context = self.browser.new_context(locale="en-US")
 
-            page = context.new_page()
+            page = self.context.new_page()
 
             self.login(page)
 
@@ -114,7 +121,7 @@ class DjinniParser:
             self.check_job_board(page)
             page.wait_for_timeout(5 * 1000)
 
-            browser.close()
+            self.browser.close()
 
 
 parser = DjinniParser(EMAIL, PASSWORD)
