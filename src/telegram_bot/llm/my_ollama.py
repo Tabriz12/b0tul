@@ -3,6 +3,7 @@ from collections.abc import Callable, Sequence
 from config import settings
 from ollama import ChatResponse, Client
 from telegram_bot.helpers.logger import setup_logger
+from telegram_bot.parsers.djinni import DjinniParser
 
 logger = setup_logger("ollama")
 
@@ -64,6 +65,14 @@ class OllamaHandler:
         except Exception as e:
             logger.error(f"Error in websearch: {e}")
             raise e
+
+    def _check_djinni_jobs(self, query: str) -> None:
+        djinni_parser = DjinniParser(
+            email=settings.get("DJINNI_EMAIL"),
+            password=settings.get("DJINNI_PASSWORD"),
+        )
+
+        djinni_parser.go_to_dashboard()
 
     def _execute_tool_call(self, tool_call) -> Sequence:  # noqa: ANN001
         name = tool_call.function.name

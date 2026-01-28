@@ -1,11 +1,9 @@
 import json
 from pathlib import Path
 
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import Locator, Page, sync_playwright
 
 from config import settings
-
-URL = "https://djinni.co/my/dashboard/#/"
 
 EMAIL = settings.get("DJINNI_EMAIL")
 
@@ -24,6 +22,8 @@ class DjinniParser:
         self.email = email
         self.password = password
         self.processed_ids = self._load_processed_ids()
+        self.dashboard_url = "https://djinni.co/my/dashboard/"
+        # self.llm_client = llm_client
 
     def _load_processed_ids(self) -> set[str]:
         if PROCESSED_FILE.exists():
@@ -45,36 +45,36 @@ class DjinniParser:
 
         page.wait_for_selector("a[href='/my/inbox/']", timeout=60000)
 
-    def check_job_board(self, page: Page) -> None:
+    def check_job_board(self, page: Page) -> tuple[Page, list[str]]:
         page.wait_for_selector("[id^='job-item-']", timeout=60000)
 
         job_ids = page.locator("[id^='job-item-']").evaluate_all(
             "els => els.map(e => e.id.replace('job-item-', ''))"
         )
 
-        print(f"{len(job_ids)} job items found.")
+        return page, job_ids
 
-        for job_id in job_ids:
-            if job_id in self.processed_ids:
-                print(f"Skipping already processed job {job_id}")
-                continue
+        # for job_id in job_ids:
+        #     if job_id in self.processed_ids:
+        #         print(f"Skipping already processed job {job_id}")
+        #         continue
 
-            print(f"Processing job {job_id}")
+        #     print(f"Processing job {job_id}")
 
-            job_page = self.context.new_page()
-            job_page.goto(page.url)
+        #     job_page = self.context.new_page()
+        #     job_page.goto(page.url)
 
-            self.process_single_job(job_page, job_id)
+        #     self.process_single_job(job_page, job_id)
 
-            print(f"Finished processing job {job_id}")
+        #     print(f"Finished processing job {job_id}")
 
-            job_page.close()
+        #     job_page.close()
 
-            # TODO: extract message / details here
+        #     # TODO: extract message / details here
 
-            # mark as processed
-            self.processed_ids.add(job_id)
-            self._save_processed_ids()
+        #     # mark as processed
+        #     self.processed_ids.add(job_id)
+        #     self._save_processed_ids()
 
     def process_single_job(self, page: Page, job_id: str) -> None:
         job_container = page.locator(f"#job-item-{job_id}")
@@ -84,10 +84,9 @@ class DjinniParser:
         # click to open job details
         title_link.click()
 
-        description_selector = "div.job-post__description"
-        page.wait_for_selector(description_selector, timeout=60000)
+        page.wait_for_selector("div.job-post__description", timeout=60000)
 
-        description = page.locator(description_selector).inner_text().strip()
+        description = page.locator("div.job-post__description").inner_text().strip()
 
         print(f"\n--- Job {job_id} description ---\n")
         print(description[:50])  # preview
@@ -99,14 +98,31 @@ class DjinniParser:
         apply_button = page.locator("button.js-inbox-toggle-reply-form").first
 
         if apply_button.is_visible():
-            print(f"Apply button found for job {job_id}")
+            self.apply_to_job(page, apply_button, description)
 
-            # apply_button.click()
-            # page.wait_for_timeout(2000)
         else:
             print(f"No apply button for job {job_id}")
 
-    def go_to_dashboard(self) -> None:
+    def apply_to_job(self, page: Page, button: Locator, description: str) -> None:
+        button.click()
+
+        apply_button = page.locator("button#job_apply").first
+
+        motivation_field = page.locator("textarea#message").first
+
+        if motivation_field.is_visible():
+            response = self.llm_client.send_message(
+                f"""Write a short and polite motivation message  f
+                or the following job description:\n\n{description}"""
+            )
+            motivation_field.fill(response)
+
+        if apply_button.is_visible():
+            print("Submitting application...")
+
+        page.wait_for_timeout(5_000)
+
+    def go_to_dashboard(self, page_num: int = 1) -> None:
         with sync_playwright() as p:
             self.browser = p.chromium.launch(headless=False)
             self.context = self.browser.new_context(locale="en-US")
@@ -115,7 +131,7 @@ class DjinniParser:
 
             self.login(page)
 
-            page.goto(URL, timeout=60000)
+            page.goto(self.dashboard_url + f"?page={page_num}", timeout=60000)
 
             page.wait_for_selector("body", timeout=60000)
             self.check_job_board(page)
