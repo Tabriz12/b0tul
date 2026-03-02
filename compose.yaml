@@ -7,9 +7,12 @@ services:
     container_name: telegram_bot
     environment:
       OLLAMA_BASE_URL: http://ollama:11434
+      DISPLAY: ${DISPLAY:-:0}
+      DYNACONF_PLAYWRIGHT_HEADLESS: ${PLAYWRIGHT_HEADLESS:-true}
     
     volumes:
       - .:/app
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
 
     command: ["poetry", "run", "python", "-m", "telegram_bot.main"]
 

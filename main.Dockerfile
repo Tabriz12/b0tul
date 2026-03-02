@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-RUN apt-get update && apt-get install -y git
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 
 ENV POETRY_VERSION=2.2.1 \
     POETRY_VIRTUALENVS_CREATE=false \
@@ -13,6 +13,7 @@ WORKDIR /app
 # only install dependencies here
 COPY . /app
 RUN poetry install
+RUN poetry run python -m playwright install --with-deps chromium
 
 
 # CMD ["poetry", "run", "python", "-m", "telegram_bot.main"]

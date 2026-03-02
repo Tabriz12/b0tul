@@ -6,3 +6,5 @@ open-webui
 *__pycache__
 *.log
 processed_jobs.json
+data/
+.ruff_cache/

@@ -3,7 +3,6 @@ from collections.abc import Callable, Sequence
 from config import settings
 from ollama import ChatResponse, Client
 from telegram_bot.helpers.logger import setup_logger
-from telegram_bot.parsers.djinni import DjinniParser
 
 logger = setup_logger("ollama")
 
@@ -67,6 +66,8 @@ class OllamaHandler:
             raise e
 
     def _check_djinni_jobs(self, query: str) -> None:
+        from telegram_bot.parsers.djinni import DjinniParser
+
         djinni_parser = DjinniParser(
             email=settings.get("DJINNI_EMAIL"),
             password=settings.get("DJINNI_PASSWORD"),
@@ -89,3 +90,31 @@ class OllamaHandler:
         except Exception as e:
             logger.error(f"Error executing tool '{name}': {e}")
             raise e
+
+    def generate_cover_letter(self, cv: str, job_description: str) -> str:
+        system_prompt = (
+            "You are an assistant that writes concise, professional cover letters "
+            "based on a user's CV and a job description. Keep it under 250 words, "
+            "use a clear structure, and avoid fabrication."
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": (
+                    "User CV:\n"
+                    f"{cv}\n\n"
+                    "Job description:\n"
+                    f"{job_description}\n\n"
+                    "Write a tailored cover letter."
+                ),
+            },
+        ]
+
+        response: ChatResponse = self.client.chat(
+            model=settings.get("OLLAMA_MODEL"),
+            messages=messages,
+        )
+
+        return response.message.content or ""
