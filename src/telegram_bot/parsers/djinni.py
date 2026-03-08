@@ -2,10 +2,12 @@ import asyncio
 import json
 from pathlib import Path
 
-from playwright.async_api import Page, async_playwright
+from anyio import sleep
+from playwright.async_api import Locator, Page, async_playwright
 
 from config import settings
 from telegram_bot.helpers.logger import setup_logger
+from telegram_bot.parsers.models import ApplicationQuestion
 
 EMAIL = settings.get("DJINNI_EMAIL")
 PASSWORD = settings.get("DJINNI_PASSWORD")
@@ -71,13 +73,11 @@ class DjinniParser:
             "els => els.map(e => e.id.replace('job-item-', ''))"
         )
 
-    async def open_job(self, page: Page, job_id: str) -> str:
+    async def open_job(self, page: Page, job_id: str) -> str | None:
         logger.info(f"Opening job {job_id}...")
         job_container = page.locator(f"#job-item-{job_id}")
-        logger.info(f"Waiting for job {job_id} container to be visible...")
 
         title_link = job_container.locator("a.job_item__header-link")
-        logger.info(f"Waiting for job {job_id} title link to be visible...")
 
         await title_link.click()
 
@@ -89,123 +89,193 @@ class DjinniParser:
             await page.locator("div.job-post__description").inner_text()
         ).strip()
 
-        logger.info(f"\n--- Job {job_id} description ---\n")
-        logger.info(description[:50])  # preview
-        logger.info("\n------------------------------\n")
+        apply_button = page.locator("button.js-inbox-toggle-reply-form").first
 
-        # TODO: save description somewhere
-        # self.save_job_description(job_id, description)
+        # if job_id in self.processed_ids:
+        #     logger.info(
+        #         f"Job {job_id} has already been processed. Skipping application."
+        #     )  # noqa: E501
 
-        return description
+        self.processed_ids.add(job_id)
+        self._save_processed_ids()
 
-    async def prepare_to_apply(self, page: Page, job_id: str) -> str | None:
-        apply_toggle = page.locator("button.js-inbox-toggle-reply-form")
+        if await apply_button.is_visible():
+            return description
 
-        if not await apply_toggle.is_visible():
-            print(f"No apply button for job {job_id}")
-
+        else:
+            logger.info(f"Job {job_id} is not open for applications.")
             return None
-
-        await apply_toggle.click()
-
-        textarea = page.locator("textarea#message")
-        await textarea.wait_for(timeout=5000)
-
-        draft = """Hello,
-        I'm interested in this role and believe my background is a good fit.
-        Looking forward to discussing further.
-        """
-
-        return draft
 
     async def submit_application(self, page: Page, message: str) -> None:
         apply_button = page.locator("button#job_apply").first
 
         motivation_field = page.locator("textarea#message").first
 
-        if motivation_field.is_visible():
+        if await motivation_field.is_visible():
             await motivation_field.fill(message)
 
-        if apply_button.is_visible():
+        if await apply_button.is_visible():
             print("Submitting application...")
-            # await apply_button.click()
+            await sleep(2)  # small delay before clicking apply
+            await apply_button.click()
 
         # wait for success signal (example)
         await page.wait_for_timeout(5_000)
 
-    async def _collect_questions(self, page: Page) -> list[dict[str, object]]:
-        script = """
-        () => {
-          const questions = [];
+    async def _collect_questions(self, page: Page) -> list[ApplicationQuestion]:
+        questions: list[ApplicationQuestion] = []
+        form = page.locator("form#apply_form").first
+        if not await form.count():
+            return questions
 
-          const textSelectors = [
-            "textarea",
-            "input[type='text']",
-            "input[type='email']",
-            "input[type='tel']",
-          ];
-
-          document.querySelectorAll(textSelectors.join(",")).forEach((el, idx) => {
-            if (el.id === "message") return;
-            const label = el.id ? document.querySelector(`label[for="${el.id}"]`) : null;
-            const text =
-              (label && label.innerText.trim()) ||
-              el.getAttribute("aria-label") ||
-              el.getAttribute("placeholder") ||
-              el.name ||
-              el.id;
-            if (!text) return;
-            questions.push({
-              type: "text",
-              name: el.name || el.id || `field-${idx}`,
-              text,
-            });
-          });
-
-          const radios = Array.from(document.querySelectorAll("input[type='radio']"));
-          const groups = new Map();
-          radios.forEach((radio) => {
-            const name = radio.name || radio.id || "radio";
-            if (!groups.has(name)) groups.set(name, []);
-            groups.get(name).push(radio);
-          });
-
-          groups.forEach((group, name) => {
-            const first = group[0];
-            const fieldset = first.closest("fieldset");
-            const legend = fieldset ? fieldset.querySelector("legend") : null;
-            let text = legend ? legend.innerText.trim() : "";
-            if (!text) {
-              const label = first.id
-                ? document.querySelector(`label[for="${first.id}"]`)
-                : null;
-              text = label ? label.innerText.trim() : name;
-            }
-
-            const options = group.map((radio) => {
-              const label = radio.id
-                ? document.querySelector(`label[for="${radio.id}"]`)
-                : null;
-              return (
-                (label && label.innerText.trim()) ||
-                radio.value ||
-                radio.getAttribute("aria-label") ||
-                radio.id
-              );
-            });
-
-            questions.push({
-              type: "radio",
-              name,
-              text,
-              options,
-            });
-          });
-
-          return questions;
+        skip_field_names = {
+            "apply",
+            "csrfmiddlewaretoken",
+            "salary_changed",
+            "cv_file_upload_id",
+            "save_msg_template",
+            "msg_template_name",
         }
-        """  # noqa: E501
-        return await page.evaluate(script)
+
+        inputs = form.locator("input:not([type='hidden'])")
+        input_count = await inputs.count()
+        for idx in range(input_count):
+            field = inputs.nth(idx)
+            input_type = ((await field.get_attribute("type")) or "text").strip().lower()
+            name = (
+                (await field.get_attribute("name"))
+                or (await field.get_attribute("id"))
+                or f"field-{idx + 1}"
+            ).strip()
+            element_id = ((await field.get_attribute("id")) or "").strip()
+
+            if (
+                not name
+                or name in skip_field_names
+                or element_id == "message"
+                or input_type == "hidden"
+                or await field.is_disabled()
+            ):
+                continue
+
+            if input_type == "radio":
+                continue
+
+            q_type = "number" if input_type == "number" else "text"
+            text = await self._get_field_label_text(page, field, name, element_id)
+            if not text:
+                continue
+
+            questions.append(ApplicationQuestion(type=q_type, name=name, text=text))
+
+        radios = form.locator("input[type='radio']")
+        radio_count = await radios.count()
+        radio_groups: dict[str, list[Locator]] = {}
+
+        for idx in range(radio_count):
+            radio = radios.nth(idx)
+            if await radio.is_disabled():
+                continue
+            name = (
+                (await radio.get_attribute("name"))
+                or (await radio.get_attribute("id"))
+                or "radio"
+            ).strip()
+            radio_groups.setdefault(name, []).append(radio)
+
+        for name, group in radio_groups.items():
+            if not group:
+                continue
+
+            first = group[0]
+            question_text = await self._get_radio_group_text(page, first, name)
+            options: list[str] = []
+            for radio in group:
+                option_text = await self._get_radio_option_text(page, radio)
+                if option_text:
+                    options.append(option_text)
+
+            questions.append(
+                ApplicationQuestion(
+                    type="radio",
+                    name=name,
+                    text=question_text,
+                    options=options,
+                )
+            )
+
+        return questions
+
+    async def _get_field_label_text(
+        self, page: Page, field: Locator, name: str, element_id: str
+    ) -> str:
+        if element_id:
+            label = page.locator(f'label[for="{element_id}"]').first
+            if await label.count():
+                return (await label.inner_text()).strip()
+
+        for attr in ("aria-label", "placeholder"):
+            value = await field.get_attribute(attr)
+            if value and value.strip():
+                return value.strip()
+
+        return name
+
+    async def _get_select_options(self, select: Locator) -> list[str]:
+        options: list[str] = []
+        option_locator = select.locator("option")
+        count = await option_locator.count()
+        for idx in range(count):
+            text = (await option_locator.nth(idx).inner_text()).strip()
+            if text:
+                options.append(text)
+        return options
+
+    async def _get_radio_group_text(
+        self, page: Page, first_radio: Locator, default_name: str
+    ) -> str:
+        fieldset = first_radio.locator("xpath=ancestor::fieldset[1]")
+        if await fieldset.count():
+            legend = fieldset.locator("legend").first
+            if await legend.count():
+                text = (await legend.inner_text()).strip()
+                if text:
+                    return text
+
+        radio_id = (await first_radio.get_attribute("id")) or ""
+        if radio_id:
+            label = page.locator(f'label[for="{radio_id}"]').first
+            if await label.count():
+                text = (await label.inner_text()).strip()
+                if text:
+                    return text
+
+        return default_name
+
+    async def _get_radio_option_text(self, page: Page, radio: Locator) -> str:
+        radio_id = (await radio.get_attribute("id")) or ""
+        if radio_id:
+            label = page.locator(f'label[for="{radio_id}"]').first
+            if await label.count():
+                text = (await label.inner_text()).strip()
+                if text:
+                    return text
+
+        for attr in ("value", "aria-label", "id"):
+            value = await radio.get_attribute(attr)
+            if value and value.strip():
+                return value.strip()
+
+        return ""
+
+    @staticmethod
+    def _lookup_answer(answers: dict[str, str], keys: list[str]) -> str | None:
+        for key in keys:
+            normalized = " ".join(key.lower().split())
+            value = answers.get(normalized)
+            if value:
+                return value
+        return None
 
     async def _fill_text_field(self, page: Page, name: str, value: str) -> None:
         script = """
@@ -246,10 +316,94 @@ class DjinniParser:
         """  # noqa: E501
         await page.evaluate(script, {"name": name, "value": value})
 
+    async def _fill_number_field(self, page: Page, name: str, value: str) -> None:
+        script = """
+        ({ name, value }) => {
+          const selector = [
+            `input[type="number"][name="${name}"]`,
+            `input[type="number"]#${name}`,
+            `input[name="${name}"]`,
+            `input#${name}`,
+          ].join(",");
+          const el = document.querySelector(selector);
+          if (!el) return false;
+          el.focus();
+          el.value = value;
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          return true;
+        }
+        """
+        await page.evaluate(script, {"name": name, "value": value})
+
+    async def _select_option(self, page: Page, name: str, value: str) -> None:
+        script = """
+        ({ name, value }) => {
+          const selector = [`select[name="${name}"]`, `select#${name}`].join(",");
+          const select = document.querySelector(selector);
+          if (!select) return false;
+
+          const target = value.trim().toLowerCase();
+          const options = Array.from(select.options || []);
+
+          let chosen = options.find((opt) => opt.value.toLowerCase() === target);
+          if (!chosen) {
+            chosen = options.find(
+              (opt) => opt.innerText.trim().toLowerCase() === target
+            );
+          }
+          if (!chosen) {
+            chosen = options.find((opt) => {
+              const optionText = opt.innerText.trim().toLowerCase();
+              const optionValue = opt.value.toLowerCase();
+              return optionText.includes(target) || optionValue.includes(target);
+            });
+          }
+          if (!chosen) return false;
+
+          select.value = chosen.value;
+          select.dispatchEvent(new Event("input", { bubbles: true }));
+          select.dispatchEvent(new Event("change", { bubbles: true }));
+          return true;
+        }
+        """
+        await page.evaluate(script, {"name": name, "value": value})
+
+    async def _fill_apply_form_fields(
+        self, page: Page, answers: dict[str, str]
+    ) -> None:
+        cv_value = self._lookup_answer(
+            answers,
+            [
+                "cv",
+                "resume",
+                "cv file",
+                "cv name",
+                "share cv",
+            ],
+        )
+        if cv_value:
+            await self._select_option(page, "cv_file_upload_id", cv_value)
+
+        salary_value = self._lookup_answer(
+            answers,
+            [
+                "salary expectations",
+                "salary expectation",
+                "expected salary",
+                "salary",
+            ],
+        )
+        if salary_value:
+            toggle = page.locator("button.js-salary-toggle-btn").first
+            if await toggle.is_visible():
+                await toggle.click()
+            await self._fill_number_field(page, "salary_changed", salary_value)
+
     async def prepare_application(
         self, page: Page, job_id: str, message: str, answers: dict[str, str]
-    ) -> list[dict[str, object]]:
-        apply_toggle = page.locator("button.js-inbox-toggle-reply-form")
+    ) -> list[ApplicationQuestion]:
+        apply_toggle = page.locator("button.js-inbox-toggle-reply-form").first
 
         if not await apply_toggle.is_visible():
             return []
@@ -259,14 +413,17 @@ class DjinniParser:
         textarea = page.locator("textarea#message")
         await textarea.wait_for(timeout=5000)
         await textarea.fill(message)
+        await self._fill_apply_form_fields(page, answers)
+
+        await sleep(3)  # wait for any dynamic changes based on filled fields
 
         questions = await self._collect_questions(page)
-        unanswered: list[dict[str, object]] = []
+        unanswered: list[ApplicationQuestion] = []
 
         for question in questions:
-            q_text = str(question.get("text", "")).strip()
-            q_type = str(question.get("type", ""))
-            q_name = str(question.get("name", "")).strip()
+            q_text = question.text.strip()
+            q_type = question.type
+            q_name = question.name.strip()
             if not q_text or not q_name:
                 continue
 
@@ -278,10 +435,16 @@ class DjinniParser:
 
             if q_type == "text":
                 await self._fill_text_field(page, q_name, answer)
+            elif q_type == "number":
+                await self._fill_number_field(page, q_name, answer)
+            elif q_type == "select":
+                await self._select_option(page, q_name, answer)
             elif q_type == "radio":
                 await self._select_radio(page, q_name, answer)
             else:
                 unanswered.append(question)
+
+            await sleep(1)  # small delay between filling fields
 
         return unanswered
 
@@ -301,13 +464,14 @@ class DjinniParser:
             jobs: list[dict[str, str | int]] = []
             for job_id in job_ids[:limit]:
                 description = await self.open_job(page, job_id)
-                jobs.append(
-                    {
-                        "job_id": job_id,
-                        "description": description,
-                        "page_num": page_num,
-                    }
-                )
+                if description:
+                    jobs.append(
+                        {
+                            "job_id": job_id,
+                            "description": description,
+                            "page_num": page_num,
+                        }
+                    )
 
                 await page.goto(f"{self.dashboard_url}?page={page_num}", timeout=60000)
 
@@ -322,7 +486,7 @@ class DjinniParser:
         message: str,
         answers: dict[str, str],
         page_num: int = 1,
-    ) -> list[dict[str, object]]:
+    ) -> list[ApplicationQuestion]:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=HEADLESS)
             context = await browser.new_context(locale="en-US")
@@ -345,7 +509,7 @@ class DjinniParser:
         message: str,
         answers: dict[str, str],
         page_num: int = 1,
-    ) -> list[dict[str, object]]:
+    ) -> list[ApplicationQuestion]:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=HEADLESS)
             context = await browser.new_context(locale="en-US")
@@ -394,7 +558,7 @@ class DjinniParser:
         message: str,
         answers: dict[str, str],
         page_num: int = 1,
-    ) -> list[dict[str, object]]:
+    ) -> list[ApplicationQuestion]:
         return asyncio.run(
             self.apply_to_job(
                 job_id=job_id,
@@ -406,8 +570,8 @@ class DjinniParser:
 
     def prepare_application_sync(
         self, job_id: str, message: str, answers: dict[str, str], page_num: int = 1
-    ) -> list[dict[str, object]]:
-        async def _run() -> list[dict[str, object]]:
+    ) -> list[ApplicationQuestion]:
+        async def _run() -> list[ApplicationQuestion]:
             async with async_playwright() as playwright:
                 browser = await playwright.chromium.launch(headless=HEADLESS)
                 context = await browser.new_context(locale="en-US")
@@ -427,27 +591,3 @@ class DjinniParser:
                 return unanswered
 
         return asyncio.run(_run())
-
-    # async def check_job_board(self, page_num: int = 1) -> list[str]:
-    #     async with async_playwright() as p:
-    #         self.browser = await p.chromium.launch(headless = HEADLESS)
-    #         self.context = await self.browser.new_context(locale="en-US")
-
-    #         page = await self.context.new_page()
-
-    #         await self.login(page)
-
-    #         await page.goto(self.dashboard_url + f"?page={page_num}", timeout=60000)
-
-    #         await page.wait_for_selector("[id^='job-item-']", timeout=60000)
-
-    #         job_ids = await page.locator("[id^='job-item-']").evaluate_all(
-    #             "els => els.map(e => e.id.replace('job-item-', ''))"
-    #         )
-
-    #         await self.browser.close()
-
-    #     return job_ids
-
-
-# parser = DjinniParser(EMAIL, PASSWORD)

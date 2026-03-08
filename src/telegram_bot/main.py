@@ -23,6 +23,8 @@ from telegram_bot.helpers.job_data import (
 from telegram_bot.helpers.logger import setup_logger
 from telegram_bot.helpers.user_data import get_user_cv, set_user_cv
 from telegram_bot.llm.my_ollama import OllamaHandler
+from telegram_bot.parsers.djinni import DjinniParser
+from telegram_bot.parsers.models import ApplicationQuestion
 
 ollama_client = OllamaHandler()
 
@@ -154,19 +156,63 @@ def _extract_page_limit_keywords(args: list[str]) -> tuple[int, int, list[str]]:
     if not args:
         return page_num, limit, keywords
 
-    first = _parse_int(args[0])
+    # Supports:
+    # /djinni_jobs 2 5 python
+    # /djinni_jobs page=2 limit=5 python
+    # /djinni_jobs --page 2 --limit 5 python
+    remaining: list[str] = []
+    idx = 0
+    while idx < len(args):
+        arg = args[idx]
+        lowered = arg.lower()
+
+        if lowered.startswith("page="):
+            parsed = _parse_int(arg.split("=", 1)[1].strip())
+            if parsed is not None:
+                page_num = parsed
+            idx += 1
+            continue
+
+        if lowered.startswith("limit="):
+            parsed = _parse_int(arg.split("=", 1)[1].strip())
+            if parsed is not None:
+                limit = parsed
+            idx += 1
+            continue
+
+        if lowered in {"--page", "-p"} and idx + 1 < len(args):
+            parsed = _parse_int(args[idx + 1])
+            if parsed is not None:
+                page_num = parsed
+                idx += 2
+                continue
+
+        if lowered in {"--limit", "-l"} and idx + 1 < len(args):
+            parsed = _parse_int(args[idx + 1])
+            if parsed is not None:
+                limit = parsed
+                idx += 2
+                continue
+
+        remaining.append(arg)
+        idx += 1
+
+    if not remaining:
+        return page_num, limit, keywords
+
+    first = _parse_int(remaining[0])
     if first is None:
-        return page_num, limit, _parse_keywords(args)
+        return page_num, limit, _parse_keywords(remaining)
     page_num = first
 
-    if len(args) > 1:
-        second = _parse_int(args[1])
+    if len(remaining) > 1:
+        second = _parse_int(remaining[1])
         if second is None:
-            return page_num, limit, _parse_keywords(args[1:])
+            return page_num, limit, _parse_keywords(remaining[1:])
         limit = second
 
-    if len(args) > 2:
-        keywords = _parse_keywords(args[2:])
+    if len(remaining) > 2:
+        keywords = _parse_keywords(remaining[2:])
 
     return page_num, limit, keywords
 
@@ -178,13 +224,13 @@ def _matches_keywords(description: str, keywords: list[str]) -> bool:
     return any(keyword.lower() in lowered for keyword in keywords)
 
 
-def _format_questions(questions: list[dict[str, object]]) -> str:
+def _format_questions(questions: list[ApplicationQuestion]) -> str:
     lines: list[str] = []
     for idx, question in enumerate(questions, start=1):
-        text = str(question.get("text", "")).strip()
-        options = question.get("options")
+        text = question.text.strip()
+        options = question.options
         options_text = ""
-        if isinstance(options, list) and options:
+        if options:
             options_text = " Options: " + ", ".join([str(o) for o in options])
         lines.append(f"{idx}. {text}{options_text}")
     return "\n".join(lines)
@@ -209,8 +255,6 @@ async def djinni_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Sta
     await update.message.reply_text("Fetching jobs and drafting cover letters...")
 
     try:
-        from telegram_bot.parsers.djinni import DjinniParser
-
         parser = DjinniParser(
             email=settings.get("DJINNI_EMAIL"),
             password=settings.get("DJINNI_PASSWORD"),
@@ -304,7 +348,8 @@ async def apply_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> State
 
         if unanswered:
             pending = {
-                f"q{idx}": question for idx, question in enumerate(unanswered, start=1)
+                f"q{idx}": question.model_dump()
+                for idx, question in enumerate(unanswered, start=1)
             }
             update_job_draft(
                 update.effective_user.id,
@@ -422,7 +467,8 @@ async def confirm_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Sta
         )
         if unanswered:
             pending = {
-                f"q{idx}": question for idx, question in enumerate(unanswered, start=1)
+                f"q{idx}": question.model_dump()
+                for idx, question in enumerate(unanswered, start=1)
             }
             update_job_draft(
                 update.effective_user.id,
