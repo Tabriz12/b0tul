@@ -10,6 +10,7 @@ A Telegram bot that parses job listings (starting with Djinni), uses local LLMs 
 ## Docker Stack
 - Build and run services: `docker compose up --build`.
 - Pull a local model: `docker compose exec ollama ollama pull gemma3`.
+- Install playwright dependencies: `docker compose exec telegram_bot poetry run python -m playwright install chromium`.
 
 ## Configuration
 - Required:

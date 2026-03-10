@@ -124,6 +124,7 @@ class DjinniParser:
 
     async def _collect_questions(self, page: Page) -> list[ApplicationQuestion]:
         questions: list[ApplicationQuestion] = []
+        seen_names: set[str] = set()
         form = page.locator("form#apply_form").first
         if not await form.count():
             return questions
@@ -138,6 +139,9 @@ class DjinniParser:
         }
 
         inputs = form.locator("input:not([type='hidden'])")
+
+        logger.info("Collecting questions from application form...")
+        logger.info(f"Found {inputs} input fields to analyze for questions.")
         input_count = await inputs.count()
         for idx in range(input_count):
             field = inputs.nth(idx)
@@ -167,6 +171,34 @@ class DjinniParser:
                 continue
 
             questions.append(ApplicationQuestion(type=q_type, name=name, text=text))
+            seen_names.add(name)
+
+        textareas = form.locator("textarea")
+        textarea_count = await textareas.count()
+        for idx in range(textarea_count):
+            field = textareas.nth(idx)
+            name = (
+                (await field.get_attribute("name"))
+                or (await field.get_attribute("id"))
+                or f"textarea-{idx + 1}"
+            ).strip()
+            element_id = ((await field.get_attribute("id")) or "").strip()
+
+            if (
+                not name
+                or name in seen_names
+                or name in skip_field_names
+                or element_id == "message"
+                or await field.is_disabled()
+            ):
+                continue
+
+            text = await self._get_field_label_text(page, field, name, element_id)
+            if not text:
+                continue
+
+            questions.append(ApplicationQuestion(type="text", name=name, text=text))
+            seen_names.add(name)
 
         radios = form.locator("input[type='radio']")
         radio_count = await radios.count()
@@ -449,7 +481,7 @@ class DjinniParser:
         return unanswered
 
     async def collect_jobs(
-        self, page_num: int = 1, limit: int = 3
+        self, page_num: int = 1, limit: int | None = None
     ) -> list[dict[str, str | int]]:
         async with async_playwright() as playwright:
             logger.info("Launching browser for job collection...")
@@ -461,8 +493,18 @@ class DjinniParser:
             job_ids = await self.get_job_ids(page, page_num=page_num)
             logger.info(f"Found job IDs on page {page_num}: {job_ids}")
 
+            target_limit = max(limit, 0) if limit is not None else None
+            if target_limit == 0:
+                await context.close()
+                await browser.close()
+                return []
+
             jobs: list[dict[str, str | int]] = []
-            for job_id in job_ids[:limit]:
+            for job_id in job_ids:
+                if job_id in self.processed_ids:
+                    logger.info(f"Job {job_id} was already processed. Skipping.")
+                    continue
+
                 description = await self.open_job(page, job_id)
                 if description:
                     jobs.append(
@@ -472,6 +514,8 @@ class DjinniParser:
                             "page_num": page_num,
                         }
                     )
+                    if target_limit is not None and len(jobs) >= target_limit:
+                        break
 
                 await page.goto(f"{self.dashboard_url}?page={page_num}", timeout=60000)
 
@@ -548,7 +592,7 @@ class DjinniParser:
         asyncio.run(_run())
 
     def collect_jobs_sync(
-        self, page_num: int = 1, limit: int = 3
+        self, page_num: int = 1, limit: int | None = None
     ) -> list[dict[str, str | int]]:
         return asyncio.run(self.collect_jobs(page_num=page_num, limit=limit))
 

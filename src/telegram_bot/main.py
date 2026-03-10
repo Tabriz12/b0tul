@@ -1,7 +1,7 @@
 import os
 from enum import IntEnum
 
-from telegram import ReplyKeyboardRemove, Update
+from telegram import BotCommand, ReplyKeyboardRemove, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -22,6 +22,12 @@ from telegram_bot.helpers.job_data import (
 )
 from telegram_bot.helpers.logger import setup_logger
 from telegram_bot.helpers.user_data import get_user_cv, set_user_cv
+from telegram_bot.helpers.user_profile_data import (
+    add_answer_example,
+    get_answer_examples,
+    get_user_preferences,
+    set_user_preferences,
+)
 from telegram_bot.llm.my_ollama import OllamaHandler
 from telegram_bot.parsers.djinni import DjinniParser
 from telegram_bot.parsers.models import ApplicationQuestion
@@ -36,6 +42,32 @@ class States(IntEnum):
     SET_CV = 2
     COVER_LETTER = 3
     EDIT_COVER_LETTER = 4
+    EDIT_COVER_LETTER_LLM = 5
+    EDIT_QUESTION_ANSWER_LLM = 6
+
+
+SUPPORTED_COMMANDS: tuple[BotCommand, ...] = (
+    BotCommand("start", "Start the bot"),
+    BotCommand("set_cv", "Save your CV text"),
+    BotCommand("cover_letter", "Generate a cover letter from a job description"),
+    BotCommand("djinni_jobs", "Fetch jobs (page/limit) and draft cover letters"),
+    BotCommand("cancel", "Cancel current input flow"),
+    BotCommand("approve", "Approve a draft"),
+    BotCommand("edit", "Edit a draft cover letter"),
+    BotCommand("edit_ai", "Edit a draft cover letter with AI"),
+    BotCommand("apply", "Prepare application and check extra questions"),
+    BotCommand("confirm", "Submit the application"),
+    BotCommand("skip", "Discard a draft"),
+    BotCommand("questions", "List pending questions for a job"),
+    BotCommand("answer", "Answer a pending question"),
+    BotCommand("edit_answer_ai", "Revise generated answer for a pending question"),
+    BotCommand("save_answer", "Save generated answer for a pending question"),
+    BotCommand("set_prefs", "Set your answering preferences/style"),
+    BotCommand("prefs", "Show your saved preferences"),
+)
+SUPPORTED_COMMAND_NAMES: tuple[str, ...] = tuple(
+    command.command for command in SUPPORTED_COMMANDS
+)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> States:
@@ -148,9 +180,9 @@ def _parse_keywords(args: list[str]) -> list[str]:
     return keywords
 
 
-def _extract_page_limit_keywords(args: list[str]) -> tuple[int, int, list[str]]:
+def _extract_page_limit_keywords(args: list[str]) -> tuple[int, int | None, list[str]]:
     page_num = 1
-    limit = 3
+    limit: int | None = None
     keywords: list[str] = []
 
     if not args:
@@ -236,6 +268,49 @@ def _format_questions(questions: list[ApplicationQuestion]) -> str:
     return "\n".join(lines)
 
 
+def _get_pending_question(
+    user_id: int, job_id: str, q_id: str
+) -> tuple[dict[str, object] | None, dict[str, object] | None]:
+    job = get_job_draft(user_id, job_id)
+    if not job:
+        return None, None
+    pending = job.get("pending_questions", {})
+    if not isinstance(pending, dict):
+        return job, None
+    question = pending.get(q_id)
+    if not isinstance(question, dict):
+        return job, None
+    return job, question
+
+
+def _finalize_pending_answer(user_id: int, job_id: str, q_id: str, answer: str) -> bool:
+    job = get_job_draft(user_id, job_id)
+    if not job:
+        return False
+
+    pending = job.get("pending_questions", {})
+    if not isinstance(pending, dict):
+        return False
+
+    question = pending.get(q_id)
+    if not isinstance(question, dict):
+        return False
+
+    q_text = str(question.get("text", "")).strip()
+    if not q_text:
+        return False
+
+    clean_answer = answer.strip()
+    if not clean_answer:
+        return False
+
+    set_answer(q_text, clean_answer)
+    add_answer_example(user_id, q_text, clean_answer)
+    pending.pop(q_id, None)
+    update_job_draft(user_id, job_id, {"pending_questions": pending, "ready": False})
+    return True
+
+
 async def djinni_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> States:
     """Fetch jobs from Djinni and prepare cover letters for approval."""
     logger.info("Handling /djinni_jobs command")
@@ -298,6 +373,7 @@ async def djinni_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Sta
             f"Draft cover letter:\n{cover_letter}\n\n"
             f"Approve with: /approve {job_id}\n"
             f"Edit with: /edit {job_id}\n"
+            f"Edit with AI: /edit_ai {job_id}\n"
             f"Prepare with: /apply {job_id}\n"
             f"Confirm with: /confirm {job_id}\n"
             f"Discard with: /skip {job_id}"
@@ -359,7 +435,10 @@ async def apply_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> State
             await update.message.reply_text(
                 "This job has extra questions:\n"
                 f"{_format_questions(unanswered)}\n\n"
-                "Answer with: /answer <job_id> <q_id> <answer>\n"
+                "Draft answer: /answer <job_id> <q_id>\n"
+                "Edit draft: /edit_answer_ai <job_id> <q_id>\n"
+                "Save draft: /save_answer <job_id> <q_id>\n"
+                "Manual answer: /answer <job_id> <q_id> <answer>\n"
                 "List pending with: /questions <job_id>"
             )
             return States.GENERIC_MESSAGE
@@ -478,7 +557,10 @@ async def confirm_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Sta
             await update.message.reply_text(
                 "This job has extra questions:\n"
                 f"{_format_questions(unanswered)}\n\n"
-                "Answer with: /answer <job_id> <q_id> <answer>\n"
+                "Draft answer: /answer <job_id> <q_id>\n"
+                "Edit draft: /edit_answer_ai <job_id> <q_id>\n"
+                "Save draft: /save_answer <job_id> <q_id>\n"
+                "Manual answer: /answer <job_id> <q_id> <answer>\n"
                 "Then run /apply <job_id> again."
             )
             return States.GENERIC_MESSAGE
@@ -520,37 +602,50 @@ async def list_questions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     for key, question in pending.items():
         text = str(question.get("text", "")).strip()
         options = question.get("options")
+        draft_answer = str(question.get("draft_answer", "")).strip()
         options_text = ""
         if isinstance(options, list) and options:
             options_text = " Options: " + ", ".join([str(o) for o in options])
-        lines.append(f"{key}: {text}{options_text}")
+        draft_text = ""
+        if draft_answer:
+            draft_text = f"\nDraft: {_preview_text(draft_answer, limit=200)}"
+        lines.append(f"{key}: {text}{options_text}{draft_text}")
 
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text(
+        "\n\n".join(lines)
+        + "\n\nDraft: /answer <job_id> <q_id>\n"
+        + "Edit draft: /edit_answer_ai <job_id> <q_id>\n"
+        + "Save draft: /save_answer <job_id> <q_id>\n"
+        + "Manual answer: /answer <job_id> <q_id> <answer>"
+    )
     return States.GENERIC_MESSAGE
 
 
 async def answer_question(update: Update, context: ContextTypes.DEFAULT_TYPE) -> States:
-    """Store a global answer and clear the pending question."""
+    """Draft an answer with AI or save a manual answer."""
     if not (update.effective_user and update.message):
         return States.GENERIC_MESSAGE
 
-    if len(context.args) < 3:
-        await update.message.reply_text("Usage: /answer <job_id> <q_id> <answer>")
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/answer <job_id> <q_id>  # generate AI draft\n"
+            "/answer <job_id> <q_id> <answer>  # save manual answer"
+        )
         return States.GENERIC_MESSAGE
 
     job_id = context.args[0]
     q_id = context.args[1]
-    answer = " ".join(context.args[2:]).strip()
+    manual_answer = " ".join(context.args[2:]).strip() if len(context.args) > 2 else ""
 
-    job = get_job_draft(update.effective_user.id, job_id)
+    user_id = update.effective_user.id
+    job, question = _get_pending_question(user_id, job_id, q_id)
     if not job:
         await update.message.reply_text(
             "No draft found for that job. Run /djinni_jobs first."
         )
         return States.GENERIC_MESSAGE
 
-    pending = job.get("pending_questions", {})
-    question = pending.get(q_id)
     if not question:
         await update.message.reply_text(
             "Unknown question id. Use /questions <job_id> to list pending."
@@ -562,16 +657,236 @@ async def answer_question(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("Question text missing. Try /apply again.")
         return States.GENERIC_MESSAGE
 
-    set_answer(q_text, answer)
-    pending.pop(q_id, None)
-    update_job_draft(
-        update.effective_user.id,
-        job_id,
-        {"pending_questions": pending, "ready": False},
-    )
+    if manual_answer:
+        saved = _finalize_pending_answer(user_id, job_id, q_id, manual_answer)
+        if not saved:
+            await update.message.reply_text("Failed to save answer. Try /apply again.")
+            return States.GENERIC_MESSAGE
+
+        await update.message.reply_text(
+            f"Saved answer globally. Run /apply {job_id} to re-check."
+        )
+        return States.GENERIC_MESSAGE
+
+    cv = get_user_cv(user_id) or ""
+    job_description = str(job.get("description", "")).strip()
+    question_type = str(question.get("type", "text")).strip()
+    raw_options = question.get("options", [])
+    options = [str(opt) for opt in raw_options] if isinstance(raw_options, list) else []
+    preferences = get_user_preferences(user_id)
+    examples = get_answer_examples(user_id, limit=8)
+
+    try:
+        draft_answer = ollama_client.generate_question_answer_template(
+            cv=cv,
+            job_description=job_description,
+            question_text=q_text,
+            question_type=question_type,
+            options=options,
+            user_preferences=preferences,
+            answer_examples=examples,
+        )
+    except Exception as e:
+        logger.error(f"Error generating answer draft for job {job_id} {q_id}: {e}")
+        await update.message.reply_text("Failed to generate answer draft.")
+        return States.GENERIC_MESSAGE
+
+    pending = job.get("pending_questions", {})
+    if not isinstance(pending, dict):
+        await update.message.reply_text(
+            "Pending questions are unavailable. Try /apply."
+        )
+        return States.GENERIC_MESSAGE
+
+    question["draft_answer"] = draft_answer
+    pending[q_id] = question
+    update_job_draft(user_id, job_id, {"pending_questions": pending, "ready": False})
+
     await update.message.reply_text(
-        f"Saved answer globally. Run /apply {job_id} to re-check."
+        f"Draft answer for {q_id}:\n{draft_answer}\n\n"
+        f"Edit with AI: /edit_answer_ai {job_id} {q_id}\n"
+        f"Save draft: /save_answer {job_id} {q_id}\n"
+        f"Or save manual: /answer {job_id} {q_id} <answer>"
     )
+    return States.GENERIC_MESSAGE
+
+
+async def save_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> States:
+    """Save the generated draft answer for a pending question."""
+    if not (update.effective_user and update.message):
+        return States.GENERIC_MESSAGE
+
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /save_answer <job_id> <q_id>")
+        return States.GENERIC_MESSAGE
+
+    user_id = update.effective_user.id
+    job_id = context.args[0]
+    q_id = context.args[1]
+    job, question = _get_pending_question(user_id, job_id, q_id)
+    if not job:
+        await update.message.reply_text(
+            "No draft found for that job. Run /djinni_jobs first."
+        )
+        return States.GENERIC_MESSAGE
+    if not question:
+        await update.message.reply_text(
+            "Unknown question id. Use /questions <job_id> to list pending."
+        )
+        return States.GENERIC_MESSAGE
+
+    draft_answer = str(question.get("draft_answer", "")).strip()
+    if not draft_answer:
+        await update.message.reply_text(
+            "No generated draft found. Run /answer <job_id> <q_id> first."
+        )
+        return States.GENERIC_MESSAGE
+
+    saved = _finalize_pending_answer(user_id, job_id, q_id, draft_answer)
+    if not saved:
+        await update.message.reply_text("Failed to save answer. Try /apply again.")
+        return States.GENERIC_MESSAGE
+
+    await update.message.reply_text(
+        f"Saved draft answer globally. Run /apply {job_id} to re-check."
+    )
+    return States.GENERIC_MESSAGE
+
+
+async def edit_answer_ai_start(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> States:
+    """Start AI-based revision of a generated answer draft."""
+    if not (update.effective_user and update.message):
+        return States.GENERIC_MESSAGE
+
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /edit_answer_ai <job_id> <q_id>")
+        return States.GENERIC_MESSAGE
+
+    user_id = update.effective_user.id
+    job_id = context.args[0]
+    q_id = context.args[1]
+    _, question = _get_pending_question(user_id, job_id, q_id)
+    if not question:
+        await update.message.reply_text(
+            "Unknown question id. Use /questions <job_id> to list pending."
+        )
+        return States.GENERIC_MESSAGE
+
+    draft_answer = str(question.get("draft_answer", "")).strip()
+    if not draft_answer:
+        await update.message.reply_text(
+            "No generated draft found. Run /answer <job_id> <q_id> first."
+        )
+        return States.GENERIC_MESSAGE
+
+    context.user_data["edit_answer_job_id"] = job_id
+    context.user_data["edit_answer_q_id"] = q_id
+    await update.message.reply_text(
+        f"Current draft for {q_id}:\n{draft_answer}\n\nSend what you want to change."
+    )
+    return States.EDIT_QUESTION_ANSWER_LLM
+
+
+async def edit_answer_ai_save(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> States:
+    """Apply AI-requested changes to generated answer draft."""
+    if not (update.effective_user and update.message and update.message.text):
+        return States.GENERIC_MESSAGE
+
+    user_id = update.effective_user.id
+    job_id = context.user_data.get("edit_answer_job_id")
+    q_id = context.user_data.get("edit_answer_q_id")
+    if not (job_id and q_id):
+        return States.GENERIC_MESSAGE
+
+    job, question = _get_pending_question(user_id, str(job_id), str(q_id))
+    if not job or not question:
+        context.user_data.pop("edit_answer_job_id", None)
+        context.user_data.pop("edit_answer_q_id", None)
+        await update.message.reply_text("Question is no longer pending.")
+        return States.GENERIC_MESSAGE
+
+    q_text = str(question.get("text", "")).strip()
+    draft_answer = str(question.get("draft_answer", "")).strip()
+    if not draft_answer or not q_text:
+        context.user_data.pop("edit_answer_job_id", None)
+        context.user_data.pop("edit_answer_q_id", None)
+        await update.message.reply_text(
+            "No draft answer to edit. Run /answer <job_id> <q_id> first."
+        )
+        return States.GENERIC_MESSAGE
+
+    try:
+        revised = ollama_client.revise_question_answer(
+            answer_draft=draft_answer,
+            question_text=q_text,
+            change_request=update.message.text,
+        )
+    except Exception as e:
+        logger.error(f"Error revising answer draft for job {job_id} {q_id}: {e}")
+        context.user_data.pop("edit_answer_job_id", None)
+        context.user_data.pop("edit_answer_q_id", None)
+        await update.message.reply_text("Failed to revise answer draft.")
+        return States.GENERIC_MESSAGE
+
+    pending = job.get("pending_questions", {})
+    if isinstance(pending, dict):
+        question["draft_answer"] = revised
+        pending[str(q_id)] = question
+        update_job_draft(
+            user_id,
+            str(job_id),
+            {"pending_questions": pending, "ready": False},
+        )
+
+    context.user_data.pop("edit_answer_job_id", None)
+    context.user_data.pop("edit_answer_q_id", None)
+
+    await update.message.reply_text(
+        f"Updated draft for {q_id}:\n{revised}\n\n"
+        f"Save it: /save_answer {job_id} {q_id}\n"
+        f"Or edit again: /edit_answer_ai {job_id} {q_id}"
+    )
+    return States.GENERIC_MESSAGE
+
+
+async def set_preferences(update: Update, context: ContextTypes.DEFAULT_TYPE) -> States:
+    """Save user preferences used for drafting answers."""
+    if not (update.effective_user and update.message):
+        return States.GENERIC_MESSAGE
+
+    if not context.args:
+        await update.message.reply_text("Usage: /set_prefs <your preferences>")
+        return States.GENERIC_MESSAGE
+
+    preferences = " ".join(context.args).strip()
+    if not preferences:
+        await update.message.reply_text("Preferences cannot be empty.")
+        return States.GENERIC_MESSAGE
+
+    set_user_preferences(update.effective_user.id, preferences)
+    await update.message.reply_text("Saved preferences for future answer drafts.")
+    return States.GENERIC_MESSAGE
+
+
+async def show_preferences(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> States:
+    """Show saved user preferences."""
+    if not (update.effective_user and update.message):
+        return States.GENERIC_MESSAGE
+
+    preferences = get_user_preferences(update.effective_user.id)
+    if not preferences:
+        await update.message.reply_text(
+            "No preferences saved yet. Set them with /set_prefs <text>."
+        )
+        return States.GENERIC_MESSAGE
+
+    await update.message.reply_text(f"Current preferences:\n{preferences}")
     return States.GENERIC_MESSAGE
 
 
@@ -620,6 +935,83 @@ async def edit_job_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> S
     return States.GENERIC_MESSAGE
 
 
+async def edit_job_ai_start(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> States:
+    """Start AI-based editing of a draft cover letter."""
+    if not (update.effective_user and update.message):
+        return States.GENERIC_MESSAGE
+
+    if not context.args:
+        await update.message.reply_text("Usage: /edit_ai <job_id>")
+        return States.GENERIC_MESSAGE
+
+    job_id = context.args[0]
+    job = get_job_draft(update.effective_user.id, job_id)
+    if not job:
+        await update.message.reply_text(
+            "No draft found for that job. Run /djinni_jobs first."
+        )
+        return States.GENERIC_MESSAGE
+
+    context.user_data["edit_ai_job_id"] = job_id
+    await update.message.reply_text(
+        "Send the changes you want (tone, style, points to add/remove)."
+    )
+    return States.EDIT_COVER_LETTER_LLM
+
+
+async def edit_job_ai_save(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> States:
+    """Apply user-requested edits to a cover letter using the LLM."""
+    if not (update.effective_user and update.message and update.message.text):
+        return States.GENERIC_MESSAGE
+
+    job_id = context.user_data.get("edit_ai_job_id")
+    if not job_id:
+        return States.GENERIC_MESSAGE
+
+    job = get_job_draft(update.effective_user.id, job_id)
+    if not job:
+        context.user_data.pop("edit_ai_job_id", None)
+        await update.message.reply_text(
+            "No draft found for that job. Run /djinni_jobs first."
+        )
+        return States.GENERIC_MESSAGE
+
+    current_cover_letter = str(job.get("cover_letter", "")).strip()
+    if not current_cover_letter:
+        context.user_data.pop("edit_ai_job_id", None)
+        await update.message.reply_text(
+            "Current draft is empty. Generate a draft first with /djinni_jobs."
+        )
+        return States.GENERIC_MESSAGE
+
+    try:
+        revised = ollama_client.revise_cover_letter(
+            current_cover_letter, update.message.text
+        )
+    except Exception as e:
+        logger.error(f"Error revising cover letter for job {job_id}: {e}")
+        await update.message.reply_text(
+            "Failed to revise the draft with AI. Please try again."
+        )
+        return States.GENERIC_MESSAGE
+
+    update_job_draft(
+        update.effective_user.id,
+        job_id,
+        {"cover_letter": revised, "approved": False, "ready": False},
+    )
+    context.user_data.pop("edit_ai_job_id", None)
+    await update.message.reply_text(
+        f"AI updated draft for job {job_id}:\n\n{revised}\n\n"
+        f"Use /approve {job_id} to confirm."
+    )
+    return States.GENERIC_MESSAGE
+
+
 # async def new_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 #     """
 #     generate a new chat session with uuid
@@ -645,11 +1037,26 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not (update.message and update.message.text):
+        return
+    command = update.message.text.split()[0]
+    available = ", ".join([f"/{name}" for name in SUPPORTED_COMMAND_NAMES])
+    await update.message.reply_text(
+        f"Unknown command: {command}\nAvailable commands: {available}"
+    )
+
+
 def get_token() -> str | None:
     token = settings.get("TELEGRAM_BOT_TOKEN")
     if token:
         return token
     return os.environ.get("TELEGRAM_BOT_TOKEN")
+
+
+async def _set_bot_commands(application: Application) -> None:
+    """Register command list shown in Telegram UI."""
+    await application.bot.set_my_commands(list(SUPPORTED_COMMANDS))
 
 
 def main() -> None:
@@ -667,7 +1074,13 @@ def main() -> None:
         write_timeout=20,
         pool_timeout=20,
     )
-    app = Application.builder().token(token).request(request).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .request(request)
+        .post_init(_set_bot_commands)
+        .build()
+    )
 
     logger.info("Starting bot... okay, registering handlers")
 
@@ -681,9 +1094,14 @@ def main() -> None:
             CommandHandler("skip", skip_job),
             CommandHandler("approve", approve_job),
             CommandHandler("edit", edit_job_start),
+            CommandHandler("edit_ai", edit_job_ai_start),
             CommandHandler("confirm", confirm_job),
             CommandHandler("questions", list_questions),
             CommandHandler("answer", answer_question),
+            CommandHandler("save_answer", save_answer),
+            CommandHandler("edit_answer_ai", edit_answer_ai_start),
+            CommandHandler("set_prefs", set_preferences),
+            CommandHandler("prefs", show_preferences),
         ],  # ty:ignore[invalid-argument-type]
         states={
             States.GENERIC_MESSAGE: [
@@ -698,8 +1116,17 @@ def main() -> None:
             States.EDIT_COVER_LETTER: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_job_save)
             ],
+            States.EDIT_COVER_LETTER_LLM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_job_ai_save)
+            ],
+            States.EDIT_QUESTION_ANSWER_LLM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_answer_ai_save)
+            ],
         },  # ty:ignore[invalid-argument-type]
-        fallbacks=[CommandHandler("cancel", cancel)],  # ty:ignore[invalid-argument-type]
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.COMMAND, unknown_command),
+        ],  # ty:ignore[invalid-argument-type]
         allow_reentry=True,
     )
 
@@ -707,6 +1134,7 @@ def main() -> None:
 
     # Handle the case when a user sends /start but they're not in a conversation
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
     app.run_polling()
 
